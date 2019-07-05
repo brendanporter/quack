@@ -1,8 +1,9 @@
-package main
+package quack
 
 import (
 	"fmt"
 	"log"
+
 	//"strings"
 	"math"
 	"testing"
