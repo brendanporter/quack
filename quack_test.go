@@ -1,16 +1,239 @@
 package quack
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
+	"net"
+	"runtime"
+	"strings"
 
 	//"strings"
 	"math"
 	"testing"
 	"time"
+
+	"golang.org/x/net/ipv4"
 )
 
-func echoResults(target string, packetsTx, packetsRx int64, minLatency, avgLatency, maxLatency, stdDevLatency float64) {
+type UnhealthyPingResult struct {
+	Target      string
+	Latency     float64
+	Time        int64
+	MessageType string `json:"mt"`
+}
+
+type TraceResult struct {
+	Hops        []PingResult
+	MessageType string `json:"mt"`
+}
+
+type PathsResult struct {
+	Paths       map[string]*PathStats
+	MessageType string `json:"mt"`
+}
+
+type HostsResult struct {
+	Hosts       map[string]*HostStats
+	MessageType string `json:"mt"`
+}
+
+var pingResults map[string][]PingResult
+
+var pingResultChan chan PingResult
+
+var resultRequestChan chan int
+var resultResponseChan chan []byte
+
+var ttlTraceResultChan chan []PingResult
+var unhealthyPingResultChan chan PingResult
+
+var pathResultsChan chan *PathStats
+var pathResultsRequestChan chan int
+var pathResultsResponseChan chan map[string]*PathStats
+
+var hostResultsChan chan *PingResult
+var hostResultsRequestChan chan int
+var hostResultsResponseChan chan map[string]*HostStats
+
+func resultProcessor() {
+
+	pingResults = make(map[string][]PingResult)
+	pingResultChan = make(chan PingResult, 10)
+
+	resultResponseChan = make(chan []byte, 10)
+	resultRequestChan = make(chan int, 10)
+	ttlTraceResultChan = make(chan []PingResult, 10)
+	unhealthyPingResultChan = make(chan PingResult, 10)
+
+	pathResultsChan = make(chan *PathStats, 10)
+	pathResultsRequestChan = make(chan int, 10)
+	pathResultsResponseChan = make(chan map[string]*PathStats, 10)
+
+	hostResultsChan = make(chan *PingResult, 10)
+	hostResultsRequestChan = make(chan int, 10)
+	hostResultsResponseChan = make(chan map[string]*HostStats, 10)
+
+	paths := make(map[string]*PathStats)
+	hosts := make(map[string]*HostStats)
+
+	for packetsTx < 100 {
+		select {
+		case pr := <-pingResultChan:
+
+			if pr.ICMPMessage.Type == ipv4.ICMPTypeDestinationUnreachable {
+				fmt.Printf("Destination network unreachable\n")
+				continue
+			}
+
+			var color string = CLR_W
+			if pr.Latency < 40.0 {
+				color = CLR_G
+			} else if pr.Latency > 65.0 && pr.Latency < 150.0 {
+				color = CLR_Y
+			} else if pr.Latency > 150.0 {
+				color = CLR_R
+			}
+
+			barCount := int((pr.Latency / 2000) * 80)
+
+			if runtime.GOOS != "windows" {
+				fmt.Printf("%d bytes from %s: icmp_seq=%d ttl=%d time=%s%.3f ms |%s|%s\n", pr.Size, pr.Peer, pr.Sequence, pr.TTL, color, pr.Latency, strings.Repeat("-", barCount), CLR_W)
+
+			} else {
+				fmt.Printf("%d bytes from %s: icmp_seq=%d ttl=%d time=%.3f ms |%s|\n", pr.Size, pr.Peer, pr.Sequence, pr.TTL, pr.Latency, strings.Repeat("-", barCount))
+			}
+
+			pingResults[pr.Target] = append(pingResults[pr.Target], pr)
+			_, err := json.Marshal(pr)
+			if err != nil {
+				log.Print(err)
+			}
+
+		case traceResult := <-ttlTraceResultChan:
+
+			tr := TraceResult{
+				Hops:        traceResult,
+				MessageType: "hops",
+			}
+			_, err := json.Marshal(tr)
+			if err != nil {
+				log.Print(err)
+			}
+
+		case unhealthyPingResult := <-unhealthyPingResultChan:
+
+			if unhealthyPingResult.Time < 100000 {
+				break
+			}
+			upr := UnhealthyPingResult{
+				Target:      unhealthyPingResult.Target,
+				Latency:     unhealthyPingResult.Latency,
+				Time:        unhealthyPingResult.Time,
+				MessageType: "unhealthyPingResult",
+			}
+			_, err := json.Marshal(upr)
+			if err != nil {
+				log.Print(err)
+			}
+
+		case <-resultRequestChan:
+			resultsJSON, err := json.Marshal(pingResults)
+			if err != nil {
+				log.Print(err)
+			}
+
+			resultResponseChan <- resultsJSON
+
+		case nps := <-pathResultsChan:
+
+			pathName := nps.PathName
+
+			if _, ok := paths[pathName]; !ok {
+				paths[pathName] = nps
+			} else {
+				paths[pathName].AvgLatency = (paths[pathName].AvgLatency + nps.AvgLatency) / 2
+				paths[pathName].MaxLatencyAvg = (paths[pathName].MaxLatencyAvg + nps.MaxLatencyAvg) / 2
+				paths[pathName].TripCount++
+			}
+
+		case pr := <-hostResultsChan:
+
+			hostName := pr.Target
+
+			if _, ok := hosts[hostName]; !ok {
+
+				hostDNSNames, err := net.LookupAddr(hostName)
+				if err != nil {
+					log.Print(err)
+				}
+
+				var hostDNSName string
+
+				if len(hostDNSNames) > 0 {
+					hostDNSName = hostDNSNames[0]
+				}
+
+				hosts[hostName] = &HostStats{}
+				if pr.Latency > 0 {
+					hosts[hostName].MinLatency = pr.Latency
+				} else {
+					hosts[hostName].MinLatency = 9999
+				}
+				hosts[hostName].AvgLatency = pr.Latency
+				hosts[hostName].HostName = hostName
+				hosts[hostName].HostDNSName = hostDNSName
+
+			} else {
+
+				if hosts[hostName].MinLatency > pr.Latency {
+					hosts[hostName].MinLatency = pr.Latency
+				}
+
+				if hosts[hostName].MaxLatency < pr.Latency {
+					hosts[hostName].MaxLatency = pr.Latency
+				}
+
+				hosts[hostName].AvgLatency = (hosts[hostName].AvgLatency + pr.Latency) / 2
+
+			}
+
+			hosts[hostName].TripCount++
+
+			if pr.Latency > 700 {
+				hosts[hostName].HighLatency700++
+			} else if pr.Latency > 400 {
+				hosts[hostName].HighLatency400++
+			} else if pr.Latency > 100 {
+				hosts[hostName].HighLatency100++
+			}
+
+		case <-pathResultsRequestChan:
+
+			prr := make(map[string]*PathStats)
+
+			for k, v := range paths {
+				prr[k] = v
+			}
+
+			pathResultsResponseChan <- paths
+
+		case <-hostResultsRequestChan:
+
+			hrr := make(map[string]*HostStats)
+
+			for k, v := range hosts {
+				hrr[k] = v
+			}
+
+			hostResultsResponseChan <- hosts
+
+		}
+
+	}
+}
+
+func echoResults(target string, packetsTx, packetsRx int, minLatency, avgLatency, maxLatency, stdDevLatency float64) {
 
 	fmt.Print("\n")
 	log.Printf("--- %s ping statistics ---", target)
@@ -27,8 +250,8 @@ func TestSendPing(t *testing.T) {
 	var minLatency float64 = 99999.9
 	var avgLatency float64
 	var stdDevLatency float64
-	var packetsTx int64
-	var packetsRx int64
+	var packetsTx int
+	var packetsRx int
 
 	target := "8.8.8.8"
 
@@ -38,7 +261,7 @@ func TestSendPing(t *testing.T) {
 		select {
 		case <-pingTicker.C:
 			packetsTx++
-			latency, err := sendPing(target, packetsTx)
+			latency, err := SendPing(target, packetsTx, pingResultChan)
 			if err != nil {
 				log.Print(err)
 				fmt.Printf("Request timeout for icmp_seq %d\n", packetsTx)
@@ -77,9 +300,9 @@ func TestSendPing(t *testing.T) {
 
 		case <-traceTicker.C:
 			go func() {
-				traceResults, err := ttlTrace(target)
+				traceResults, err := TTLTrace(target)
 				if err != nil {
-					elog.Print(err)
+					log.Print(err)
 				}
 
 				ttlTraceResultChan <- traceResults
@@ -116,9 +339,9 @@ func TestSendPing(t *testing.T) {
 				if latencyHighWaterMark > 100 {
 					log.Printf("High latency of %.1fms detected. Performing additional traces.", latencyHighWaterMark)
 					for x := 0; x < 4; x++ {
-						traceResults, err := ttlTrace(target)
+						traceResults, err := TTLTrace(target)
 						if err != nil {
-							elog.Print(err)
+							log.Print(err)
 						}
 
 						_ = traceResults
