@@ -29,11 +29,11 @@ type PingResult struct {
 	Target      string
 	Latency     float64
 	Time        int64
-	ICMPMessage *icmp.Message
+	ICMPMessage *icmp.Message `json:"-"`
 	Size        int
 	TTL         int
 	Sequence    int
-	Peer        net.Addr
+	Peer        net.Addr `json:"-"`
 }
 
 var thirtySampleRollingLatency []float64
@@ -172,7 +172,9 @@ func TTLTrace(targetIP string) ([]PingResult, error) {
 	return traceResultSlice, nil
 }
 
-func SendPing(targetIP string, seq, size int, pingResultChan chan PingResult) (float64, error) {
+var txPings int
+
+func SendPing(targetIP string, size int, pingResultChan chan PingResult) (float64, error) {
 
 	var latency float64
 
@@ -205,7 +207,7 @@ func SendPing(targetIP string, seq, size int, pingResultChan chan PingResult) (f
 		Code: 0,
 		Body: &icmp.Echo{
 			ID:   os.Getpid() & 0xffff,
-			Seq:  int(seq),
+			Seq:  txPings,
 			Data: payload,
 		},
 	}
@@ -263,11 +265,14 @@ LISTEN:
 		Size:        size,
 		TTL:         ttl,
 		Peer:        peer,
+		Sequence:    txPings,
 	}
 
 	if rm.Type == ipv4.ICMPTypeTimeExceeded {
 		pr.Latency = 2000
 	}
+
+	txPings++
 
 	pingResultChan <- pr
 
