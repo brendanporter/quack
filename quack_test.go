@@ -77,7 +77,7 @@ func resultProcessor() {
 	paths := make(map[string]*PathStats)
 	hosts := make(map[string]*HostStats)
 
-	for packetsTx < 100 {
+	for i := 0; i < 100; i++ {
 		select {
 		case pr := <-pingResultChan:
 
